@@ -1,0 +1,261 @@
+// =======================================================
+// NeoShops – Sign Based Economy
+// NeoForge 21.1.215 | MC 1.21.1 | ATM10 5.4
+// KubeJS 6 | Rhino Safe
+// =======================================================
+
+var CURRENCY = '$'
+var STARTING_BALANCE = 1000
+
+// =======================================================
+// ECONOMY
+// =======================================================
+
+var Economy = {}
+
+Economy.data = function () {
+  return Utils.server.persistentData
+}
+
+Economy.init = function () {
+  var d = this.data()
+  if (!d.contains('balances')) d.put('balances', {})
+}
+
+Economy.get = function (uuid) {
+  this.init()
+  var b = this.data().get('balances')
+  if (b[uuid] == null) b[uuid] = STARTING_BALANCE
+  return b[uuid]
+}
+
+Economy.add = function (uuid, amount) {
+  this.init()
+  var b = this.data().get('balances')
+  var v = b[uuid] == null ? STARTING_BALANCE : b[uuid]
+  v += amount
+  if (v < 0) v = 0
+  b[uuid] = v
+}
+
+// =======================================================
+// PERMISSIONS
+// =======================================================
+
+function isOp(player) {
+  return player.isOp()
+}
+
+function hasPerm(player, perm) {
+  if (isOp(player)) return true
+  if (player.hasPermission('neoshops.*')) return true
+  return player.hasPermission(perm)
+}
+
+// =======================================================
+// SHOP REGISTRY
+// =======================================================
+
+function shopRegistry() {
+  var d = Utils.server.persistentData
+  if (!d.contains('shops')) d.put('shops', {})
+  return d.get('shops')
+}
+
+function registerShop(id, data) {
+  shopRegistry()[id] = data
+}
+
+function getShop(id) {
+  return shopRegistry()[id]
+}
+
+// =======================================================
+// PLAYER STATE (ARMING)
+// =======================================================
+
+function armShop(player, admin) {
+  player.persistentData.putBoolean('shop_arm', true)
+  player.persistentData.putBoolean('shop_admin', admin)
+}
+
+// =======================================================
+// SIGN PLACEMENT
+// =======================================================
+
+BlockEvents.placed(function (e) {
+  var player = e.player
+  var block = e.block
+
+  if (!block.id.includes('sign')) return
+  if (!player.persistentData.getBoolean('shop_arm')) return
+
+  player.persistentData.putBoolean('shop_arm', false)
+
+  var admin = player.persistentData.getBoolean('shop_admin')
+  player.persistentData.putBoolean('shop_admin', false)
+
+  if (admin && !hasPerm(player, 'neoshops.admin')) {
+    player.tell('§cNo permission.')
+    return
+  }
+
+  var text = block.getSignText()
+  var mode = text[0].toUpperCase()
+
+  if (mode !== 'BUY' && mode !== 'SELL') {
+    player.tell('§cLine 1 must be BUY or SELL.')
+    return
+  }
+
+  var item = text[2]
+  var price = parseInt(text[3])
+
+  if (!item || isNaN(price) || price <= 0) {
+    player.tell('§cInvalid item or price.')
+    return
+  }
+
+  if (!admin) {
+    var back = block.offset(block.getFacing().getOpposite())
+    if (!back.hasContainer()) {
+      player.tell('§cPlayer shops require chest or barrel.')
+      return
+    }
+  }
+
+  var id = block.pos.toShortString()
+
+  registerShop(id, {
+    owner: player.uuid,
+    admin: admin,
+    mode: mode,
+    item: item,
+    price: price,
+    pos: id
+  })
+
+  player.tell('§aShop created.')
+})
+
+// =======================================================
+// SHOP INTERACTION
+// =======================================================
+
+BlockEvents.rightClicked(function (e) {
+  var block = e.block
+  var player = e.player
+
+  if (!block.id.includes('sign')) return
+
+  var shop = getShop(block.pos.toShortString())
+  if (!shop) return
+
+  if (shop.admin && !hasPerm(player, 'neoshops.player')) {
+    player.tell('§cNo permission.')
+    return
+  }
+
+  var qty = player.isShiftKeyDown() ? 64 : 1
+  var cost = shop.price * qty
+
+  if (shop.mode === 'BUY') {
+    if (Economy.get(player.uuid) < cost) {
+      player.tell('§cNot enough money.')
+      return
+    }
+
+    if (!shop.admin) {
+      var back = block.offset(block.getFacing().getOpposite())
+      if (back.inventory.count(shop.item) < qty) {
+        player.tell('§cNo stock available.')
+        return
+      }
+      back.inventory.extract(shop.item, qty)
+    }
+
+    Economy.add(player.uuid, -cost)
+    player.give(qty + ' ' + shop.item)
+    player.tell('§aPurchased.')
+
+  } else {
+    if (player.inventory.count(shop.item) < qty) {
+      player.tell('§cYou do not have enough items.')
+      return
+    }
+
+    if (!shop.admin) {
+      var back2 = block.offset(block.getFacing().getOpposite())
+      back2.inventory.insert(shop.item, qty)
+    }
+
+    player.inventory.extract(shop.item, qty)
+    Economy.add(player.uuid, cost)
+    player.tell('§aSold.')
+  }
+})
+
+// =======================================================
+// COMMANDS
+// =======================================================
+
+ServerEvents.commandRegistry(function (e) {
+  var C = e.commands
+  var A = e.arguments
+
+  e.register(C.literal('bal').executes(function (ctx) {
+    ctx.source.player.tell(
+      '§eBalance: ' + CURRENCY + Economy.get(ctx.source.player.uuid)
+    )
+    return 1
+  }))
+
+  e.register(
+    C.literal('pay')
+      .then(A.STRING('target')
+        .then(A.INTEGER('amount')
+          .executes(function (ctx) {
+            var s = ctx.source.player
+            var t = ctx.source.server.getPlayer(ctx.get('target'))
+            var a = ctx.get('amount')
+            if (!t || a <= 0 || Economy.get(s.uuid) < a) return 0
+            Economy.add(s.uuid, -a)
+            Economy.add(t.uuid, a)
+            return 1
+          })
+        )
+      )
+  )
+
+  e.register(C.literal('shopadd').executes(function (ctx) {
+    armShop(ctx.source.player, false)
+    ctx.source.player.tell('§ePlace a sign.')
+    return 1
+  }))
+
+  e.register(C.literal('shopaddadmin').executes(function (ctx) {
+    if (!hasPerm(ctx.source.player, 'neoshops.admin')) return 0
+    armShop(ctx.source.player, true)
+    ctx.source.player.tell('§ePlace admin shop sign.')
+    return 1
+  }))
+
+  e.register(C.literal('listshops').executes(function (ctx) {
+    var uuid = ctx.source.player.uuid
+    var shops = shopRegistry()
+    for (var k in shops) {
+      if (shops[k].owner === uuid) {
+        ctx.source.player.tell('§7' + shops[k].pos)
+      }
+    }
+    return 1
+  }))
+
+  e.register(C.literal('shopspublic').executes(function (ctx) {
+    var shops = shopRegistry()
+    for (var k in shops) {
+      ctx.source.player.tell('§7' + shops[k].item + ' @ ' + shops[k].price)
+    }
+    return 1
+  }))
+})
