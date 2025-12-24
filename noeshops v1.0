@@ -1,0 +1,320 @@
+// Sign Shops Script for ATM10 NeoForge 1.21.1
+// Features: Player and admin sign-based shops, chest stock, virtual "$" currency, LuckPerms integration
+// All settings configurable via /shopconfig command
+
+// --- Configuration Defaults ---
+let CONFIG = {
+    currencySymbol: '$', // Displayed in messages
+    startingBalance: 1000, // New players start with $1000
+};
+
+// --- Initialize LuckPerms Permissions ---
+onEvent('server.load', event => {
+    let luckPerms = Platform.getMod('luckperms');
+    if (luckPerms && luckPerms.isLoaded()) {
+        // Register permission nodes
+        event.server.runCommandSilent('luckperms permission register signshops.create'); // Create player shops
+        event.server.runCommandSilent('luckperms permission register signshops.use'); // Use shops (buy/sell)
+        event.server.runCommandSilent('luckperms permission register signshops.break'); // Break shops
+        event.server.runCommandSilent('luckperms permission register signshops.create.infinite'); // Create admin shops
+        console.log('SignShops: Registered LuckPerms nodes');
+    } else {
+        console.log('SignShops: LuckPerms not detected, using OP-only permissions');
+    }
+});
+
+// --- Balance Management ---
+function getBalance(player) {
+    let data = player.persistentData;
+    if (!data.contains('money')) {
+        data.putInt('money', CONFIG.startingBalance);
+    }
+    return data.getInt('money');
+}
+
+function setBalance(player, amount) {
+    if (amount < 0) amount = 0; // Prevent negative balances
+    player.persistentData.putInt('money', amount);
+}
+
+// --- Validate Item ID ---
+function isValidItem(itemId) {
+    // Check if item exists in Minecraft or ATM10 mods
+    try {
+        let item = Item.of(itemId);
+        return item != null && !item.isEmpty();
+    } catch (e) {
+        return false;
+    }
+}
+
+// --- Handle Sign Right-Click (Buying/Selling) ---
+onEvent('player.right_click_block', event => {
+    const { player, block, server } = event;
+    if (!block.id.includes('sign')) return; // Only process signs
+
+    let signLines = block.getSignText();
+    let line1 = signLines[0].toLowerCase();
+    let ownerUUID = block.getEntityData().getString('ShopOwner') || '';
+    let isAdminShop = line1 === '[adminbuy]' || line1 === '[adminsell]';
+
+    // Check use permission
+    let isOp = player.hasGameRulePermission(4);
+    let hasUsePerm = isOp || (Platform.getMod('luckperms') && server.runCommandSilent(`luckperms user ${player.uuid} permission check signshops.use`) === 'true');
+    if (!hasUsePerm) {
+        player.tell('You lack permission to use shops! (signshops.use)');
+        return;
+    }
+
+    // Parse sign format: [Buy]/[Sell]/[AdminBuy]/[AdminSell] quantity item / price
+    let parts = signLines[1].split(' '); // Line 2: quantity item
+    let price = parseInt(signLines[3]); // Line 4: price
+    if (parts.length < 2 || isNaN(price) || price <= 0) {
+        player.tell('Invalid shop format! Use: [Type] quantity item / price');
+        return;
+    }
+    let quantity = parseInt(parts[0]);
+    let item = parts.slice(1).join('_').toLowerCase();
+    if (!isValidItem(item)) {
+        player.tell(`Invalid item: ${item}`);
+        return;
+    }
+
+    // Get chest inventory (for player shops)
+    let chestInventory = null;
+    if (!isAdminShop) {
+        let chestBlock = block.offset(block.facing.opposite); // Chest behind sign
+        if (chestBlock.hasContainer()) {
+            chestInventory = chestBlock.inventory;
+        } else {
+            player.tell('Shop sign must be on a chest!');
+            return;
+        }
+    }
+
+    // Handle Buy (player buys from shop)
+    if (line1 === '[buy]' || line1 === '[adminbuy]') {
+        let balance = getBalance(player);
+        if (balance < price) {
+            player.tell(`Not enough money! Need: ${CONFIG.currencySymbol}${price} (You have: ${CONFIG.currencySymbol}${balance})`);
+            return;
+        }
+        if (!isAdminShop) {
+            // Check chest stock
+            let stockCount = chestInventory.count(item);
+            if (stockCount < quantity) {
+                player.tell('No stock available for purchase!');
+                return;
+            }
+            // Remove stock and give item
+            chestInventory.extract(item, quantity);
+        }
+        setBalance(player, balance - price);
+        player.give(`${quantity} ${item}`);
+        player.tell(`Bought ${quantity} ${item} for ${CONFIG.currencySymbol}${price}!`);
+    }
+    // Handle Sell (player sells to shop)
+    else if (line1 === '[sell]' || line1 === '[adminsell]') {
+        let playerItemCount = player.inventory.count(`minecraft:${item}`);
+        if (playerItemCount < quantity) {
+            player.tell(`Not enough ${item}! Need: ${quantity} (You have: ${playerItemCount})`);
+            return;
+        }
+        if (!isAdminShop) {
+            // Check chest space
+            let maxStack = Item.of(item).maxStackSize;
+            let chestSpace = chestInventory.getFreeSpaceFor(item);
+            if (chestSpace < quantity) {
+                player.tell('Shop chest is full!');
+                return;
+            }
+            // Add to chest
+            chestInventory.insert(item, quantity);
+        }
+        player.inventory.extract(`minecraft:${item}`, quantity);
+        let balance = getBalance(player);
+        setBalance(player, balance + price);
+        player.tell(`Sold ${quantity} ${item} for ${CONFIG.currencySymbol}${price}!`);
+    }
+});
+
+// --- Handle Sign Placement (Shop Creation) ---
+onEvent('block.place', event => {
+    const { player, block, server } = event;
+    if (!block.id.includes('sign')) return;
+
+    let signLines = block.getSignText();
+    let line1 = signLines[0].toLowerCase();
+    let isAdminShop = line1 === '[adminbuy]' || line1 === '[adminsell]';
+    let isPlayerShop = line1 === '[buy]' || line1 === '[sell]';
+
+    if (!isAdminShop && !isPlayerShop) return;
+
+    // Check permission
+    let isOp = player.hasGameRulePermission(4);
+    let hasCreatePerm = isOp || (Platform.getMod('luckperms') && server.runCommandSilent(`luckperms user ${player.uuid} permission check signshops.create`) === 'true');
+    let hasInfinitePerm = isOp || (Platform.getMod('luckperms') && server.runCommandSilent(`luckperms user ${player.uuid} permission check signshops.create.infinite`) === 'true');
+
+    if (isAdminShop && !hasInfinitePerm) {
+        player.tell('You lack permission to create admin shops! (signshops.create.infinite)');
+        block.set('minecraft:air');
+        player.give('minecraft:oak_sign');
+        return;
+    }
+    if (isPlayerShop && !hasCreatePerm) {
+        player.tell('You lack permission to create shops! (signshops.create)');
+        block.set('minecraft:air');
+        player.give('minecraft:oak_sign');
+        return;
+    }
+
+    // Validate sign format
+    let parts = signLines[1].split(' ');
+    let price = parseInt(signLines[3]);
+    if (parts.length < 2 || isNaN(price) || price <= 0) {
+        player.tell('Invalid shop format! Use: [Type] quantity item / price');
+        block.set('minecraft:air');
+        player.give('minecraft:oak_sign');
+        return;
+    }
+    let quantity = parseInt(parts[0]);
+    let item = parts.slice(1).join('_').toLowerCase();
+    if (!isValidItem(item)) {
+        player.tell(`Invalid item: ${item}`);
+        block.set('minecraft:air');
+        player.give('minecraft:oak_sign');
+        return;
+    }
+
+    // Check chest for player shops
+    if (isPlayerShop) {
+        let chestBlock = block.offset(block.facing.opposite);
+        if (!chestBlock.hasContainer()) {
+            player.tell('Shop sign must be placed on a chest!');
+            block.set('minecraft:air');
+            player.give('minecraft:oak_sign');
+            return;
+        }
+    }
+
+    // Store owner UUID
+    block.setEntityData({ ShopOwner: player.uuid });
+    player.tell(`Shop created successfully! (${line1})`);
+});
+
+// --- Prevent Unauthorized Shop Breaking ---
+onEvent('block.break', event => {
+    const { player, block, server } = event;
+    if (block.id.includes('sign') && block.getEntityData().getString('ShopOwner')) {
+        let ownerUUID = block.getEntityData().getString('ShopOwner');
+        let isOp = player.hasGameRulePermission(4);
+        let hasBreakPerm = isOp || (Platform.getMod('luckperms') && server.runCommandSilent(`luckperms user ${player.uuid} permission check signshops.break`) === 'true');
+        if (player.uuid !== ownerUUID && !hasBreakPerm) {
+            player.tell('You cannot break this shop! (signshops.break)');
+            event.cancel();
+        }
+    }
+});
+
+// --- Commands ---
+onEvent('command.registry', event => {
+    const { commands: Commands } = event;
+
+    // /bal or /balance: Check balance
+    Commands.literal('bal')
+        .alias('balance')
+        .executes(ctx => {
+            let player = ctx.source.player;
+            let balance = getBalance(player);
+            player.tell(`Your balance: ${CONFIG.currencySymbol}${balance}`);
+            return 1;
+        });
+
+    // /pay <username> <amount>: Send money
+    Commands.literal('pay')
+        .then(Commands.argument('target', Commands.get('player'))
+            .then(Commands.argument('amount', Commands.get('integer'))
+                .executes(ctx => {
+                    let player = ctx.source.player;
+                    let target = ctx.get('target');
+                    let amount = ctx.get('amount');
+                    if (amount <= 0) {
+                        player.tell('Amount must be positive!');
+                        return 0;
+                    }
+                    let balance = getBalance(player);
+                    if (balance < amount) {
+                        player.tell(`Not enough money! You have: ${CONFIG.currencySymbol}${balance}`);
+                        return 0;
+                    }
+                    setBalance(player, balance - amount);
+                    let targetBalance = getBalance(target);
+                    setBalance(target, targetBalance + amount);
+                    player.tell(`Sent ${CONFIG.currencySymbol}${amount} to ${target.name}!`);
+                    target.tell(`Received ${CONFIG.currencySymbol}${amount} from ${player.name}!`);
+                    return 1;
+                })));
+
+    // /givemoney <player> <amount>: OP-only give money
+    Commands.literal('givemoney')
+        .requires(src => src.hasPermission(4))
+        .then(Commands.argument('target', Commands.get('player'))
+            .then(Commands.argument('amount', Commands.get('integer'))
+                .executes(ctx => {
+                    let target = ctx.get('target');
+                    let amount = ctx.get('amount');
+                    if (amount <= 0) {
+                        ctx.source.tell('Amount must be positive!');
+                        return 0;
+                    }
+                    let balance = getBalance(target);
+                    setBalance(target, balance + amount);
+                    target.tell(`You received ${CONFIG.currencySymbol}${amount}! New balance: ${CONFIG.currencySymbol}${balance + amount}`);
+                    ctx.source.tell(`Gave ${CONFIG.currencySymbol}${amount} to ${target.name}`);
+                    return 1;
+                })));
+
+    // /setmoney <player> <amount>: OP-only set balance
+    Commands.literal('setmoney')
+        .requires(src => src.hasPermission(4))
+        .then(Commands.argument('target', Commands.get('player'))
+            .then(Commands.argument('amount', Commands.get('integer'))
+                .executes(ctx => {
+                    let target = ctx.get('target');
+                    let amount = ctx.get('amount');
+                    if (amount < 0) {
+                        ctx.source.tell('Amount cannot be negative!');
+                        return 0;
+                    }
+                    setBalance(target, amount);
+                    target.tell(`Your balance was set to ${CONFIG.currencySymbol}${amount}`);
+                    ctx.source.tell(`Set ${target.name}'s balance to ${CONFIG.currencySymbol}${amount}`);
+                    return 1;
+                })));
+
+    // /shopconfig <setting> <value>: Configure settings
+    Commands.literal('shopconfig')
+        .requires(src => src.hasPermission(4))
+        .then(Commands.argument('setting', Commands.get('string'))
+            .then(Commands.argument('value', Commands.get('string'))
+                .executes(ctx => {
+                    let setting = ctx.get('setting').toLowerCase();
+                    let value = ctx.get('value');
+                    if (setting === 'currencysymbol') {
+                        CONFIG.currencySymbol = value;
+                        ctx.source.tell(`Currency symbol set to: ${value}`);
+                    } else if (setting === 'startingbalance') {
+                        let num = parseInt(value);
+                        if (isNaN(num) || num < 0) {
+                            ctx.source.tell('Starting balance must be a non-negative number!');
+                            return 0;
+                        }
+                        CONFIG.startingBalance = num;
+                        ctx.source.tell(`Starting balance set to: ${CONFIG.currencySymbol}${num}`);
+                    } else {
+                        ctx.source.tell('Unknown setting! Use: currencysymbol, startingbalance');
+                        return 0;
+                    }
+                    return 1;
+                })));
+});
