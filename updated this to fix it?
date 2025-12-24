@@ -1,0 +1,113 @@
+// =======================================================
+// COMMANDS (KubeJS 6 SAFE)
+// =======================================================
+
+ServerEvents.commandRegistry(function (e) {
+
+  var C = e.commands
+  var A = e.arguments
+
+  // /bal and /balance
+  function showBal(ctx) {
+    ctx.source.player.tell(
+      '§eBalance: ' + CURRENCY + getBalance(ctx.source.player)
+    )
+    return 1
+  }
+
+  e.register(C.literal('bal').executes(showBal))
+  e.register(C.literal('balance').executes(showBal))
+
+
+  // /pay <player> <amount>
+  e.register(
+    C.literal('pay')
+      .then(
+        A.player('target')
+          .then(
+            A.integer('amount')
+              .executes(function (ctx) {
+
+                var sender = ctx.source.player
+                var target = ctx.get('target')
+                var amount = ctx.get('amount')
+
+                if (amount <= 0 || getBalance(sender) < amount) {
+                  sender.tell('§cInvalid amount.')
+                  return 0
+                }
+
+                setBalance(sender, getBalance(sender) - amount)
+                setBalance(target, getBalance(target) + amount)
+
+                sender.tell('§aPaid ' + CURRENCY + amount + ' to ' + target.name)
+                target.tell('§aReceived ' + CURRENCY + amount + ' from ' + sender.name)
+                return 1
+              })
+          )
+      )
+  )
+
+
+  // /eco admin commands
+  function ecoPerm(ctx) {
+    if (!hasPerm(ctx.source.player, 'neoshops.admin')) {
+      ctx.source.player.tell('§cNo permission.')
+      return false
+    }
+    return true
+  }
+
+  e.register(
+    C.literal('eco')
+
+      .then(C.literal('give')
+        .then(A.player('target')
+          .then(A.integer('amount')
+            .executes(ctx => {
+              if (!ecoPerm(ctx)) return 0
+              Economy.add(ctx.get('target').uuid, ctx.get('amount'))
+              return 1
+            })
+          )
+        )
+      )
+
+      .then(C.literal('take')
+        .then(A.player('target')
+          .then(A.integer('amount')
+            .executes(ctx => {
+              if (!ecoPerm(ctx)) return 0
+              Economy.add(ctx.get('target').uuid, -ctx.get('amount'))
+              return 1
+            })
+          )
+        )
+      )
+
+      .then(C.literal('set')
+        .then(A.player('target')
+          .then(A.integer('amount')
+            .executes(ctx => {
+              if (!ecoPerm(ctx)) return 0
+              Economy.set(ctx.get('target').uuid, ctx.get('amount'))
+              return 1
+            })
+          )
+        )
+      )
+
+      .then(C.literal('bal')
+        .then(A.player('target')
+          .executes(ctx => {
+            if (!ecoPerm(ctx)) return 0
+            ctx.source.player.tell(
+              ctx.get('target').name + ': ' +
+              CURRENCY + Economy.get(ctx.get('target').uuid)
+            )
+            return 1
+          })
+        )
+      )
+  )
+})
